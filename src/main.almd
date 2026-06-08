@@ -39,13 +39,15 @@ let DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
 let FEW_SHOT_K = 5
 let MAX_TOKENS = 512
 
-type Persona = {
+// 注: 型名は依存パッケージと被らせない (fizz_persona.Persona と衝突すると
+// flat codegen で別パッケージの関数が本型に解決され壊れる)。
+type LoadedPersona = {
   system_prompt: String,
   examples: List[ex.FewShotExample],
 }
 
 type State = {
-  persona: Persona,
+  persona: LoadedPersona,
   model: String,
   history: ch.History,
 }
@@ -64,21 +66,16 @@ effect fn main() -> Unit = {
   }
 }
 
-// persona ディレクトリから system.md / examples.tsv を読む。
-// spec.json があれば検証に使う (任意)。
-effect fn load_persona(dir: String) -> Result[Persona, String] = {
+// persona ディレクトリから system.md (必須) / examples.tsv (任意) を読む。
+effect fn load_persona(dir: String) -> Result[LoadedPersona, String] = {
   let system_prompt = fs.read_text("${dir}/system.md")!
-  let tsv = read_optional("${dir}/examples.tsv")
-  ok(Persona {
+  let tsv_path = "${dir}/examples.tsv"
+  let tsv = if fs.exists(tsv_path) then fs.read_text(tsv_path)! else ""
+  ok(LoadedPersona {
     system_prompt: system_prompt,
     examples: ex.parse_examples_tsv(tsv),
   })
 }
-
-// 無ければ空文字 (examples.tsv は任意)。
-effect fn read_optional(path: String) -> String =
-  if fs.exists(path) then result.unwrap_or(fs.read_text(path), "")
-  else ""
 
 effect fn run(initial: State) -> Unit = {
   var state = initial
@@ -90,14 +87,16 @@ effect fn run(initial: State) -> Unit = {
     } else {
       match comment.comment_from_json(line) {
         err(e) => eprintln("[brain] skipping malformed comment: ${e}"),
-        // handle は常に State を返す (内部でエラーを握って state を維持)。
-        ok(c)  => { state = result.unwrap_or(handle(state, c), state) },
+        ok(c)  => match handle(state, c) {
+          ok(s2) => { state = s2 },
+          err(e) => eprintln("[brain] handle error: ${e}"),
+        },
       }
     }
   }
 }
 
-effect fn handle(state: State, c: comment.Comment) -> State = {
+effect fn handle(state: State, c: comment.Comment) -> Result[State, String] = {
   // 参考: コメントのリアクション感情をログ (返答生成には LLM を使う)。
   match classifier.classify(c.text) {
     some(_) => (),
@@ -117,15 +116,16 @@ effect fn handle(state: State, c: comment.Comment) -> State = {
   let msgs = pb.build(inputs)
   let opts = llm.defaults() |> llm.with_max_tokens(MAX_TOKENS) |> llm.with_temperature(0.8)
   match llm.call_with(state.model, msgs, opts) {
+    // LLM エラーは握って state を維持 (パイプは止めない)。
     err(e) => {
       eprintln("[brain] llm error: ${e}")
-      state
+      ok(state)
     },
     ok(resp) => {
       let frags = parser.parse_all(resp.content, parser.default_options())
       emit_all(frags)
       let h2 = ch.push_assistant(ch.push_user(state.history, c.user, c.text), resp.content)
-      { ...state, history: h2 }
+      ok({ ...state, history: h2 })
     },
   }
 }

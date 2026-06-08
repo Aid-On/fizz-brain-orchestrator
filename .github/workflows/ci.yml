@@ -29,7 +29,9 @@ jobs:
           tar xzf /tmp/almide.tar.gz -C /tmp
           sudo install /tmp/almide-linux-x86_64/almide /usr/local/bin/almide
           almide --version
-      - name: Type-check CLI entry
-        run: almide check src/main.almd
       - name: Run tests
         run: almide test
+      # almide check より厳しい full codegen でビルドできることまで確認
+      # (型名衝突や effect-fn 戻り型の問題は build でしか出ないことがある)。
+      - name: Build CLI binary
+        run: almide build src/main.almd -o build/fizz-brain-orchestrator
