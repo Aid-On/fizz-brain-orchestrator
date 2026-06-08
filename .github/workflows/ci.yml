@@ -33,5 +33,8 @@ jobs:
         run: almide test
       # almide check より厳しい full codegen でビルドできることまで確認
       # (型名衝突や effect-fn 戻り型の問題は build でしか出ないことがある)。
+      # -o の親ディレクトリは almide が作らないので先に mkdir する。
       - name: Build CLI binary
-        run: almide build src/main.almd -o build/fizz-brain-orchestrator
+        run: |
+          mkdir -p build
+          almide build src/main.almd -o build/fizz-brain-orchestrator
