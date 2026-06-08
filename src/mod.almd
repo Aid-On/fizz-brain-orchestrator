@@ -1,0 +1,69 @@
+// fizz_brain_orchestrator (pure 部分) — 部品間の型変換と注釈。
+//
+// 責務 (一行): comment → speak ストリームのパイプラインを「合成」する薄い層。
+// ここには副作用の無い変換だけ置き、IO とループは main.almd が持つ。
+//
+// almai は現行 almide で壊れているため、LLM 層は fizz_llm_client
+// (almai 互換 interface の自前実装) を使う。almai が直ったら
+// fizz_llm_client を almai に差し替えるだけで済む。
+
+import fizz_persona.examples as ex
+import fizz_prompt_builder as pb
+import fizz_conversation_history as ch
+import fizz_llm_client as llm
+import fizz_thinking_cue_detector as think
+import fizz_protocol.speak
+import fizz_protocol.emotion
+
+// few-shot-retriever の例 → prompt-builder の (質問, 回答) タプル。
+fn to_pb_example(e: ex.FewShotExample) -> (String, String) =
+  (e.question, e.answer)
+
+// 会話履歴のターン → LLM メッセージ。
+fn turn_to_message(t: ch.Turn) -> llm.Message =
+  match t.role {
+    ch.UserTurn      => llm.user(t.text),
+    ch.AssistantTurn => llm.assistant(t.text),
+  }
+
+// 思考キューが立っていて fx 未指定なら fx:thinking を補う。
+// (発話する文に対してのみ呼ぶ — idle/応答待ちでは呼ばない)
+fn annotate_thinking(f: speak.SentenceFragment) -> speak.SentenceFragment =
+  if think.should_play_thinking(f) then
+    match f.fx {
+      some(_) => f,
+      none    => { ...f, fx: some("thinking") },
+    }
+  else f
+
+// ── in-file tests ────────────────────────────────────────────────────
+
+test "few-shot example converts to prompt-builder example" {
+  let e = ex.FewShotExample { question: "q", answer: "a" }
+  let p = to_pb_example(e)
+  assert_eq(p.0, "q")
+  assert_eq(p.1, "a")
+}
+
+test "user/assistant turns map to llm messages" {
+  let h = ch.push_assistant(ch.push_user(ch.with_default_cap(), "viewer", "hi"), "yo")
+  let msgs = list.map(ch.turns(h), turn_to_message)
+  assert_eq(list.first(msgs)!.role, "user")
+  assert_eq(list.first(msgs)!.content, "hi")
+  assert_eq(list.last(msgs)!.role, "assistant")
+}
+
+test "thinking cue adds fx:thinking when absent" {
+  let f = speak.SentenceFragment { emotion: emotion.Neutral, message: "うーん、そうだね。", hair: none, fx: none }
+  assert_eq(annotate_thinking(f).fx, some("thinking"))
+}
+
+test "existing fx is preserved" {
+  let f = speak.SentenceFragment { emotion: emotion.Excited, message: "うーん、やった！", hair: none, fx: some("banzai") }
+  assert_eq(annotate_thinking(f).fx, some("banzai"))
+}
+
+test "plain speech is left untouched" {
+  let f = speak.SentenceFragment { emotion: emotion.Happy, message: "こんにちは！", hair: none, fx: none }
+  assert_eq(annotate_thinking(f).fx, none)
+}

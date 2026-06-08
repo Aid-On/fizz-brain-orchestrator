@@ -1,0 +1,137 @@
+// fizz-brain-orchestrator CLI — comment NDJSON → sentence-fragment NDJSON。
+//
+// 責務 (一行): コメントを受けて LLM 応答を文フラグメントに変換して流す。
+//
+// パイプライン (1 コメントあたり):
+//   comment → classify(参考ログ) → few-shot 検索 → prompt 構築 →
+//   LLM 呼び出し (fizz_llm_client) → 文 + タグに切り出し →
+//   thinking 注釈 → SentenceFragment を NDJSON で stdout へ。
+//   会話履歴は窓つきで保持 (前の話題を引きずらせない)。
+//
+// 使い方:
+//   fizz-youtube-chat-source | fizz-comment-dedupe \
+//     | FIZZ_PERSONA_DIR=personae/lime FIZZ_MODEL=anthropic/claude-haiku-4-5 \
+//       fizz-brain-orchestrator \
+//     | fizz-tts ...   (= 後続の voice 部品: SentenceFragment → 音声)
+//
+// stdout はデータ専用 (SentenceFragment NDJSON)。ログは stderr。
+// 出力は SpeakItem ではなく SentenceFragment (テキスト世界) — 音声化は
+// 後続の TTS 部品の責務。SpeakItem.audio は in-process 専用でワイヤを越えない。
+//
+// 注: first-time-greeter は recall/memory が配線されてから組み込む
+// (本 v1 は memory 層未接続のため未使用)。
+
+import self as orch
+import fizz_protocol.comment
+import fizz_protocol.speak
+import fizz_persona.examples as ex
+import fizz_prompt_builder as pb
+import fizz_conversation_history as ch
+import fizz_few_shot_retriever as fewshot
+import fizz_stream_sentence_parser as parser
+import fizz_comment_classifier as classifier
+import fizz_llm_client as llm
+import fs
+import io
+import env
+
+let DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
+let FEW_SHOT_K = 5
+let MAX_TOKENS = 512
+
+type Persona = {
+  system_prompt: String,
+  examples: List[ex.FewShotExample],
+}
+
+type State = {
+  persona: Persona,
+  model: String,
+  history: ch.History,
+}
+
+effect fn main() -> Unit = {
+  let dir = string.trim(env.get("FIZZ_PERSONA_DIR") ?? "")
+  guard dir != "" else eprintln("[brain] missing env: FIZZ_PERSONA_DIR (persona directory)")
+  let model_env = string.trim(env.get("FIZZ_MODEL") ?? "")
+  let model = if model_env == "" then DEFAULT_MODEL else model_env
+  match load_persona(dir) {
+    err(e) => eprintln("[brain] failed to load persona: ${e}"),
+    ok(p)  => {
+      eprintln("[brain] persona loaded (${int.to_string(list.len(p.examples))} examples), model=${model}")
+      run(State { persona: p, model: model, history: ch.with_default_cap() })
+    },
+  }
+}
+
+// persona ディレクトリから system.md / examples.tsv を読む。
+// spec.json があれば検証に使う (任意)。
+effect fn load_persona(dir: String) -> Result[Persona, String] = {
+  let system_prompt = fs.read_text("${dir}/system.md")!
+  let tsv = read_optional("${dir}/examples.tsv")
+  ok(Persona {
+    system_prompt: system_prompt,
+    examples: ex.parse_examples_tsv(tsv),
+  })
+}
+
+// 無ければ空文字 (examples.tsv は任意)。
+effect fn read_optional(path: String) -> String =
+  if fs.exists(path) then result.unwrap_or(fs.read_text(path), "")
+  else ""
+
+effect fn run(initial: State) -> Unit = {
+  var state = initial
+  var open = true
+  while open {
+    let line = io.read_line()
+    if string.trim(line) == "" then {
+      open = false
+    } else {
+      match comment.comment_from_json(line) {
+        err(e) => eprintln("[brain] skipping malformed comment: ${e}"),
+        // handle は常に State を返す (内部でエラーを握って state を維持)。
+        ok(c)  => { state = result.unwrap_or(handle(state, c), state) },
+      }
+    }
+  }
+}
+
+effect fn handle(state: State, c: comment.Comment) -> State = {
+  // 参考: コメントのリアクション感情をログ (返答生成には LLM を使う)。
+  match classifier.classify(c.text) {
+    some(_) => (),
+    none    => (),
+  }
+  let picked = fewshot.select(c.text, state.persona.examples, FEW_SHOT_K)
+  let pb_examples = list.map(picked, orch.to_pb_example)
+  let history_msgs = list.map(ch.turns(state.history), orch.turn_to_message)
+  let inputs = pb.Inputs {
+    system_prompt: state.persona.system_prompt,
+    recall_preamble: none,
+    examples: pb_examples,
+    history: history_msgs,
+    comment_user: c.user,
+    comment_text: c.text,
+  }
+  let msgs = pb.build(inputs)
+  let opts = llm.defaults() |> llm.with_max_tokens(MAX_TOKENS) |> llm.with_temperature(0.8)
+  match llm.call_with(state.model, msgs, opts) {
+    err(e) => {
+      eprintln("[brain] llm error: ${e}")
+      state
+    },
+    ok(resp) => {
+      let frags = parser.parse_all(resp.content, parser.default_options())
+      emit_all(frags)
+      let h2 = ch.push_assistant(ch.push_user(state.history, c.user, c.text), resp.content)
+      { ...state, history: h2 }
+    },
+  }
+}
+
+effect fn emit_all(frags: List[speak.SentenceFragment]) -> Unit = {
+  for f in frags {
+    println(speak.fragment_to_json(orch.annotate_thinking(f)))
+  }
+}
